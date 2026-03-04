@@ -193,12 +193,21 @@ class LinearProblem:
             self.solver.getPC().setFieldSplitIS(*fieldsplit_IS)
 
     def __del__(self):
-        self._solver.destroy()
-        self._A.destroy()
-        self._b.destroy()
-        self._x.destroy()
-        if self._P_mat is not None:
-            self._P_mat.destroy()
+        solver = getattr(self, "_solver", None)
+        if solver is not None:
+            solver.destroy()
+        A = getattr(self, "_A", None)
+        if A is not None:
+            A.destroy()
+        b = getattr(self, "_b", None)
+        if b is not None:
+            b.destroy()
+        x = getattr(self, "_x", None)
+        if x is not None:
+            x.destroy()
+        P_mat = getattr(self, "_P_mat", None)
+        if P_mat is not None:
+            P_mat.destroy()
 
     def solve(self) -> dolfinx.fem.Function | Sequence[dolfinx.fem.Function]:
         """Solve the problem.
