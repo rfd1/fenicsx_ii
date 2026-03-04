@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 from collections.abc import Sequence
+from functools import partial
 
 from petsc4py import PETSc
 
@@ -33,12 +34,9 @@ from petsc4py import PETSc
 import dolfinx
 
 assert dolfinx.has_petsc4py
-from functools import partial
-
-import numpy as np
-from numpy import typing as npt
 
 import dolfinx.la.petsc
+import numpy as np
 import ufl
 from dolfinx.fem import IntegralType, pack_coefficients, pack_constants
 from dolfinx.fem.assemble import apply_lifting as _apply_lifting
@@ -48,10 +46,13 @@ from dolfinx.fem.forms import Form
 from dolfinx.fem.forms import extract_function_spaces as _extract_function_spaces
 from dolfinx.fem.function import Function as _Function
 from dolfinx.mesh import EntityMap as _EntityMap
+from numpy import typing as npt
 
 from .assembly import assign_LG_map, average_coefficients
 from .forms import CompiledFormBundle, compile_form_bundle, derivative_block
+from .matrix_assembler import assemble_matrix as assemble_matrix_restricted
 from .matrix_assembler import create_matrix
+from .vector_assembler import assemble_vector as assemble_vector_restricted
 from .vector_assembler import create_vector
 
 __all__ = [
@@ -260,9 +261,34 @@ def _flatten_forms(
     return flattened
 
 
+def _contains_ufl_form(
+    forms: (
+        ufl.form.Form
+        | Sequence[ufl.form.Form | Sequence[ufl.form.Form] | None]
+        | Form
+        | Sequence[Form]
+        | Sequence[Sequence[Form]]
+        | None
+    ),
+) -> bool:
+    if forms is None or isinstance(forms, Form):
+        return False
+    if isinstance(forms, ufl.Form):
+        return True
+    if isinstance(forms, Sequence):
+        for entry in forms:
+            if entry is None or isinstance(entry, Form):
+                continue
+            if isinstance(entry, ufl.Form):
+                return True
+            if isinstance(entry, Sequence) and _contains_ufl_form(entry):
+                return True
+    return False
+
+
 def _assemble_compiled_residual(
     b: PETSc.Vec,  # type: ignore[name-defined]
-    residual: Form | Sequence[Form] | CompiledFormBundle,
+    residual: Form | Sequence[Form] | Sequence[ufl.form.Form] | CompiledFormBundle,
 ) -> None:
     if isinstance(residual, CompiledFormBundle):
         if residual.direct is not None:
@@ -303,6 +329,12 @@ def _assemble_compiled_residual(
                 )
             b_local.destroy()
     else:
+        if isinstance(residual, Sequence) and not isinstance(residual, Form):
+            if _contains_ufl_form(residual):
+                assemble_vector_restricted(residual, b=b)  # type: ignore[arg-type]
+            else:
+                dolfinx.fem.petsc.assemble_vector(b, residual)
+            return
         dolfinx.fem.petsc.assemble_vector(b, residual)
 
 
@@ -370,7 +402,13 @@ def _map_matrix_contribution(
 
 def _assemble_compiled_matrix(
     A: PETSc.Mat,  # type: ignore[name-defined]
-    form_data: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
+    form_data: (
+        Form
+        | Sequence[Form]
+        | Sequence[Sequence[Form]]
+        | Sequence[Sequence[ufl.form.Form | None]]
+        | CompiledFormBundle
+    ),
     bcs: Sequence[DirichletBC],
 ) -> None:
     if isinstance(form_data, CompiledFormBundle):
@@ -401,6 +439,9 @@ def _assemble_compiled_matrix(
         _apply_dirichlet_rows(A, bcs, form_data.test_space, form_data.trial_space)
     else:
         if isinstance(form_data, Sequence) and not isinstance(form_data, Form):
+            if _contains_ufl_form(form_data):
+                assemble_matrix_restricted(form_data, bcs=bcs, A=A)  # type: ignore[arg-type]
+                return
             is_flat_list = all(
                 (entry is None) or isinstance(entry, Form) for entry in form_data
             ) and not any(isinstance(entry, Sequence) for entry in form_data)
@@ -492,15 +533,24 @@ def assemble_residual(
         is_nested = any(isinstance(entry, Sequence) for entry in jacobian)
         if is_nested:
             # Nest and blocked lifting
-            bcs1 = _bcs_by_block(_extract_function_spaces(jacobian, 1), bcs)  # type: ignore[arg-type]
             if bcs:
-                if all((form is None) or hasattr(form, "_cpp_object") for row in jacobian for form in row):  # type: ignore[arg-type]
+                bcs1 = _bcs_by_block(
+                    _extract_function_spaces(jacobian, 1), bcs
+                )  # type: ignore[arg-type]
+                if all(
+                    (form is None) or hasattr(form, "_cpp_object")
+                    for row in jacobian
+                    for form in row
+                ):  # type: ignore[arg-type]
                     apply_lifting(b, jacobian, bcs=bcs1, x0=x, alpha=-1.0)
-                    dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[attr-defined]
+                    dolfinx.la.petsc._ghost_update(
+                        b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
+                    )  # type: ignore[attr-defined]
                 else:
                     raise RuntimeError(
                         "Dirichlet residual lifting for block/nest problems requires "
-                        "compiled Jacobian blocks; algebraic lifting fallback is disabled."
+                        "compiled Jacobian blocks; algebraic lifting fallback "
+                        "is disabled."
                     )
                 if isinstance(residual, CompiledFormBundle):
                     if residual.direct is None:
@@ -514,7 +564,9 @@ def assemble_residual(
                 set_bc(b, bcs0, x0=x, alpha=-1.0)
         else:
             if bcs:
-                lifting_forms = [form for form in jacobian if form is not None and form.rank == 2]
+                lifting_forms = [
+                    form for form in jacobian if form is not None and form.rank == 2
+                ]
                 if len(lifting_forms) == 0:
                     raise RuntimeError(
                         "Dirichlet residual lifting requires a compiled Jacobian form; "
@@ -704,6 +756,7 @@ class NonlinearProblem:
         bcs = [] if bcs is None else bcs
         if J is None:
             J = derivative_block(F, u)
+        self._uses_raw_ufl_sequence_fallback = False
 
         try:
             self._F_bundle = compile_form_bundle(
@@ -712,8 +765,22 @@ class NonlinearProblem:
                 jit_options=jit_options,
                 entity_maps=entity_maps,
             )
+            self._F = (
+                self._F_bundle.direct
+                if self._F_bundle.direct is not None
+                else self._F_bundle
+            )
         except Exception as exc:
-            raise RuntimeError("Could not compile residual form.") from exc
+            if (
+                isinstance(F, Sequence)
+                and not isinstance(F, ufl.Form)
+                and _contains_ufl_form(F)
+            ):
+                self._uses_raw_ufl_sequence_fallback = True
+                self._F_bundle = None
+                self._F = F
+            else:
+                raise RuntimeError("Could not compile residual form.") from exc
 
         try:
             self._J_bundle = compile_form_bundle(
@@ -722,8 +789,22 @@ class NonlinearProblem:
                 jit_options=jit_options,
                 entity_maps=entity_maps,
             )
+            self._J = (
+                self._J_bundle.direct
+                if self._J_bundle.direct is not None
+                else self._J_bundle
+            )
         except Exception as exc:
-            raise RuntimeError("Could not compile Jacobian form.") from exc
+            if (
+                isinstance(J, Sequence)
+                and not isinstance(J, ufl.Form)
+                and _contains_ufl_form(J)
+            ):
+                self._uses_raw_ufl_sequence_fallback = True
+                self._J_bundle = None
+                self._J = J
+            else:
+                raise RuntimeError("Could not compile Jacobian form.") from exc
 
         if P is not None:
             try:
@@ -733,38 +814,47 @@ class NonlinearProblem:
                     jit_options=jit_options,
                     entity_maps=entity_maps,
                 )
+                self._preconditioner = (
+                    self._P_bundle.direct
+                    if self._P_bundle.direct is not None
+                    else self._P_bundle
+                )
             except Exception as exc:
-                raise RuntimeError("Could not compile preconditioner form.") from exc
+                if (
+                    isinstance(P, Sequence)
+                    and not isinstance(P, ufl.Form)
+                    and _contains_ufl_form(P)
+                ):
+                    self._uses_raw_ufl_sequence_fallback = True
+                    self._P_bundle = None
+                    self._preconditioner = P
+                else:
+                    raise RuntimeError(
+                        "Could not compile preconditioner form."
+                    ) from exc
         else:
             self._P_bundle = None
-
-        self._F = (
-            self._F_bundle.direct
-            if self._F_bundle.direct is not None
-            else self._F_bundle
-        )
-        self._J = (
-            self._J_bundle.direct
-            if self._J_bundle.direct is not None
-            else self._J_bundle
-        )
-        self._preconditioner = (
-            self._P_bundle.direct
-            if (self._P_bundle is not None and self._P_bundle.direct is not None)
-            else (
-                None
-                if self._P_bundle is None
-                else self._P_bundle
-            )
-        )
+            self._preconditioner = None
 
         def _has_compiled_lifting_path(
-            form_data: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
+            form_data: (
+                Form
+                | Sequence[Form]
+                | Sequence[Sequence[Form]]
+                | CompiledFormBundle
+                | None
+            ),
         ) -> bool:
+            if form_data is None:
+                return False
             if isinstance(form_data, CompiledFormBundle):
                 if form_data.direct is not None:
-                    return any(form.rank == 2 for form in _flatten_forms(form_data.direct))
-                return any(contribution.rank == 2 for contribution in form_data.contributions)
+                    return any(
+                        form.rank == 2 for form in _flatten_forms(form_data.direct)
+                    )
+                return any(
+                    contribution.rank == 2 for contribution in form_data.contributions
+                )
             if isinstance(form_data, Sequence):
                 flattened = _flatten_forms(form_data)
                 return len(flattened) > 0 and all(
@@ -772,6 +862,12 @@ class NonlinearProblem:
                     for form in flattened
                 )
             return hasattr(form_data, "_cpp_object") and form_data.rank == 2
+
+        if self._uses_raw_ufl_sequence_fallback and bcs:
+            raise RuntimeError(
+                "Raw UFL sequence fallback currently supports only bcs=[]. "
+                "Dirichlet lifting requires compiled Jacobian form(s)."
+            )
 
         if bcs and not _has_compiled_lifting_path(self._J_bundle):
             raise RuntimeError(
@@ -786,7 +882,7 @@ class NonlinearProblem:
 
         # Create PETSc structures for the residual, Jacobian and solution
         # vector
-        if self._J_bundle.direct is not None:
+        if self._J_bundle is not None and self._J_bundle.direct is not None:
             self._A = dolfinx.fem.petsc.create_matrix(self._J_bundle.direct, kind=kind)
         else:
             self._A = create_matrix(
@@ -797,8 +893,8 @@ class NonlinearProblem:
             )
 
         # Create PETSc structure for preconditioner if provided
-        if self._P_bundle is not None:
-            if self._P_bundle.direct is not None:
+        if P is not None:
+            if self._P_bundle is not None and self._P_bundle.direct is not None:
                 self._P_mat = dolfinx.fem.petsc.create_matrix(
                     self._P_bundle.direct, kind=kind
                 )
@@ -817,7 +913,7 @@ class NonlinearProblem:
         )
         assert matrix_kind is None or isinstance(matrix_kind, str)
 
-        if self._F_bundle.direct is not None:
+        if self._F_bundle is not None and self._F_bundle.direct is not None:
             spaces = _extract_function_spaces(self._F_bundle.direct)
             self._b = dolfinx.fem.petsc.create_vector(spaces, kind=matrix_kind)
             self._x = dolfinx.fem.petsc.create_vector(spaces, kind=matrix_kind)
@@ -839,22 +935,22 @@ class NonlinearProblem:
         # residual computation functions
         jacobian_cb = (
             self._J_bundle.direct
-            if self._J_bundle.direct is not None
-            else self._J_bundle
+            if (self._J_bundle is not None and self._J_bundle.direct is not None)
+            else (J if self._J_bundle is None else self._J_bundle)
         )
         preconditioner_cb = (
             None
-            if self._P_bundle is None
+            if P is None
             else (
                 self._P_bundle.direct
-                if self._P_bundle.direct is not None
-                else self._P_bundle
+                if (self._P_bundle is not None and self._P_bundle.direct is not None)
+                else (P if self._P_bundle is None else self._P_bundle)
             )
         )
         residual_cb = (
             self._F_bundle.direct
-            if self._F_bundle.direct is not None
-            else self._F_bundle
+            if (self._F_bundle is not None and self._F_bundle.direct is not None)
+            else (F if self._F_bundle is None else self._F_bundle)
         )
 
         self._snes = PETSc.SNES().create(self.A.comm)  # type: ignore[attr-defined]
