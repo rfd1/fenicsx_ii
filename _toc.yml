@@ -9,6 +9,7 @@ parts:
     chapters:
       - file: "demos/coupled_poisson_solver"
       - file: "demos/coupled_domains"
+      - file: "demos/nonlinear_poisson_periodic_coupling"
 
   - caption: Reference
     chapters:
