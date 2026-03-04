@@ -10,6 +10,7 @@ from .restriction_operators import (
     ReductionOperator,
 )
 from .solver import LinearProblem
+from .petsc import NonlinearProblem
 from .ufl_operations import Average
 from .vector_assembler import assemble_vector, create_vector
 
@@ -21,6 +22,7 @@ __all__ = [
     "create_interpolation_matrix",
     "Average",
     "LinearProblem",
+    "NonlinearProblem",
     "assemble_vector",
     "create_vector",
     "assemble_matrix",

@@ -1,4 +1,5 @@
 import typing
+from collections.abc import Sequence
 
 from petsc4py import PETSc
 
@@ -13,7 +14,7 @@ __all__ = ["assemble_vector"]
 
 
 def assemble_vector(
-    L: ufl.Form,
+    L: ufl.Form | Sequence[ufl.Form | None],
     bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
     form_compiler_options: dict | None = None,
     jit_options: dict | None = None,
@@ -37,7 +38,6 @@ def assemble_vector(
             If None, a new vector is created.
     """
     bcs = [] if bcs is None else bcs
-    num_arguments = len(L.arguments())
     if b is None:
         b = create_vector(
             L,
@@ -45,6 +45,38 @@ def assemble_vector(
             jit_options=jit_options,
             entity_maps=entity_maps,
         )
+
+    if isinstance(L, Sequence) and not isinstance(L, ufl.Form):
+        _vecs = b.getNestSubVecs()  # type: ignore[attr-defined]
+        if len(_vecs) != len(L):
+            [vec.destroy() for vec in _vecs]
+            raise ValueError("Vector nest size does not match number of linear forms.")
+        for i, form_i in enumerate(L):
+            if form_i is None:
+                continue
+            if len(form_i.arguments()) != 1:
+                [vec.destroy() for vec in _vecs]
+                raise ValueError("Each block residual form must be linear.")
+            assemble_vector_and_apply_restriction(
+                _vecs[i],
+                form_i,
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
+            space = form_i.arguments()[0].ufl_function_space()._cpp_object
+            for bc in bcs:
+                if bc.function_space == space:
+                    dolfinx.fem.petsc.set_bc(_vecs[i], [bc])
+            _vecs[i].ghostUpdate(
+                addv=PETSc.InsertMode.INSERT_VALUES,  # type: ignore[attr-defined]
+                mode=PETSc.ScatterMode.FORWARD,  # type: ignore[attr-defined]
+            )
+        [vec.destroy() for vec in _vecs]
+        return b
+
+    assert isinstance(L, ufl.Form)
+    num_arguments = len(L.arguments())
     if num_arguments == 1:
         assemble_vector_and_apply_restriction(
             b,
@@ -62,30 +94,29 @@ def assemble_vector(
             mode=PETSc.ScatterMode.FORWARD,  # type: ignore[attr-defined]
         )
         return b
-    else:
-        linear_form = ufl.extract_blocks(L)
-        num_spaces = len(linear_form)
-        _vecs = b.getNestSubVecs()  # type: ignore
 
-        for i in range(num_spaces):
-            if linear_form[i] is not None:
-                assemble_vector_and_apply_restriction(
-                    _vecs[i],
-                    linear_form[i],
-                    form_compiler_options=form_compiler_options,
-                    jit_options=jit_options,
-                    entity_maps=entity_maps,
-                )
-                space = linear_form[i].arguments()[0].ufl_function_space()._cpp_object
-                for bc in bcs:
-                    if bc.function_space == space:
-                        dolfinx.fem.petsc.set_bc(_vecs[i], [bc])
-                _vecs[i].ghostUpdate(
-                    addv=PETSc.InsertMode.INSERT_VALUES,  # type: ignore[attr-defined]
-                    mode=PETSc.ScatterMode.FORWARD,  # type: ignore[attr-defined]
-                )
-        [vec.destroy() for vec in _vecs]
-        return b
+    linear_form = ufl.extract_blocks(L)
+    num_spaces = len(linear_form)
+    _vecs = b.getNestSubVecs()  # type: ignore[attr-defined]
+    for i in range(num_spaces):
+        if linear_form[i] is not None:
+            assemble_vector_and_apply_restriction(
+                _vecs[i],
+                linear_form[i],
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
+            space = linear_form[i].arguments()[0].ufl_function_space()._cpp_object
+            for bc in bcs:
+                if bc.function_space == space:
+                    dolfinx.fem.petsc.set_bc(_vecs[i], [bc])
+            _vecs[i].ghostUpdate(
+                addv=PETSc.InsertMode.INSERT_VALUES,  # type: ignore[attr-defined]
+                mode=PETSc.ScatterMode.FORWARD,  # type: ignore[attr-defined]
+            )
+    [vec.destroy() for vec in _vecs]
+    return b
 
 
 def assemble_vector_and_apply_restriction(
@@ -217,7 +248,7 @@ def create_subvector(
 
 
 def create_vector(
-    L: ufl.Form,
+    L: ufl.Form | Sequence[ufl.Form | None],
     form_compiler_options: dict | None = None,
     jit_options: dict | None = None,
     entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -234,16 +265,29 @@ def create_vector(
         form_compiler_options: Options to pass to the form compiler.
         jit_options: Options to pass to the JIT compiler.
     """
+    if isinstance(L, Sequence) and not isinstance(L, ufl.Form):
+        b = [None for _ in range(len(L))]
+        for i, form_i in enumerate(L):
+            if form_i is not None:
+                b[i] = create_subvector(
+                    form_i,
+                    form_compiler_options,
+                    jit_options,
+                    entity_maps,
+                )
+        return PETSc.Vec().createNest(b)  # type: ignore[attr-defined]
+
+    assert isinstance(L, ufl.Form)
     num_arguments = len(L.arguments())
     if num_arguments == 1:
         return create_subvector(L, form_compiler_options, jit_options, entity_maps)
-    else:
-        linear_form = ufl.extract_blocks(L)
-        num_spaces = len(linear_form)
-        b = [None for _ in range(num_spaces)]
-        for i in range(num_spaces):
-            if linear_form[i] is not None:
-                b[i] = create_subvector(
-                    linear_form[i], form_compiler_options, jit_options, entity_maps
-                )
-        return PETSc.Vec().createNest(b)  # type: ignore
+
+    linear_form = ufl.extract_blocks(L)
+    num_spaces = len(linear_form)
+    b = [None for _ in range(num_spaces)]
+    for i in range(num_spaces):
+        if linear_form[i] is not None:
+            b[i] = create_subvector(
+                linear_form[i], form_compiler_options, jit_options, entity_maps
+            )
+    return PETSc.Vec().createNest(b)  # type: ignore[attr-defined]

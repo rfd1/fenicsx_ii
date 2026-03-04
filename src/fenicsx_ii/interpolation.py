@@ -8,7 +8,7 @@ import numpy.typing as npt
 from dolfinx.common import IndexMap as _im
 
 from .interpolation_utils import create_extended_indexmap, evaluate_basis_function
-from .restriction_operators import ReductionOperator
+from .restriction_operators import MappedRestriction, ReductionOperator
 from .utils import send_dofs_to_other_process, unroll_dofmap
 
 
@@ -31,6 +31,7 @@ def create_interpolation_matrix(
         red_op: Reduction operator for each interpolation point on `K`.
         tol: Tolerance for determining point ownership across processes.
         use_petsc: Flag to indicate whether to use PETSc for the matrix.
+        cells_K: cells of function space to interpolate to
         complex_dtype: Create a matrix with complex dtype
 
     Returns:
@@ -49,6 +50,19 @@ def create_interpolation_matrix(
         cells_K = np.arange(num_cells_K, dtype=np.int32)
     else:
         num_cells_K = len(cells_K)
+
+    if isinstance(red_op, MappedRestriction):
+        same_to = (red_op._mesh is mesh_to) or (
+            hasattr(red_op._mesh, "_cpp_object")
+            and hasattr(mesh_to, "_cpp_object")
+            and red_op._mesh._cpp_object is mesh_to._cpp_object
+        )
+
+        if not same_to:
+            raise ValueError(
+                "MappedRestriction mesh must match target mesh K.mesh. "
+                "Define the mapping from target points to source points."
+            )
 
     quadrature_rule = red_op.compute_quadrature(cells_K, reference_interpolation_points)
     quad_points = quadrature_rule.points
@@ -75,7 +89,11 @@ def create_interpolation_matrix(
     ip_sender = (
         point_ownership.src_owner
     )  # For IP in 1D grid, what process has taken ownership
-    assert (ip_sender >= 0).all()
+
+    assert (ip_sender >= 0).all(), (
+        "Could not locate all mapped interpolation points on source mesh; "
+        "check mapping operator/domain overlap."
+    )
     ip_owner = point_ownership.dest_owner  # For received data, who sent it
 
     num_dofs_per_cell_K = K.dofmap.list.shape[1]

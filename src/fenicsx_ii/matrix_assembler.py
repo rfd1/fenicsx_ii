@@ -1,4 +1,5 @@
 import typing
+from collections.abc import Sequence
 
 from petsc4py import PETSc
 
@@ -13,7 +14,7 @@ __all__ = ["assemble_matrix"]
 
 
 def assemble_matrix(
-    a: ufl.Form,
+    a: ufl.Form | Sequence[Sequence[ufl.Form | None]],
     bcs: typing.Sequence[dolfinx.fem.DirichletBC] | None = None,
     form_compiler_options: dict | None = None,
     jit_options: dict | None = None,
@@ -33,7 +34,6 @@ def assemble_matrix(
             a new matrix is created.
     """
     bcs = [] if bcs is None else bcs
-    num_arguments = len(a.arguments())
     if A is None:
         A = create_matrix(
             a,
@@ -42,6 +42,33 @@ def assemble_matrix(
             entity_maps=entity_maps,
         )
 
+    if isinstance(a, Sequence) and not isinstance(a, ufl.Form):
+        for i, row in enumerate(a):
+            if not isinstance(row, Sequence):
+                raise ValueError("Nested matrix form input must be row-wise sequences.")
+            for j, block in enumerate(row):
+                Aij = A.getNestSubMatrix(i, j)  # type: ignore[attr-defined]
+                if block is None:
+                    continue
+                assemble_matrix_and_apply_restriction(
+                    Aij,
+                    block,
+                    form_compiler_options=form_compiler_options,
+                    jit_options=jit_options,
+                    entity_maps=entity_maps,
+                )
+                spaces = [
+                    arg.ufl_function_space()._cpp_object for arg in block.arguments()
+                ]
+                on_diagonal = float(spaces[0] == spaces[1])
+                for bc in bcs:
+                    if bc.function_space == spaces[0]:
+                        dofs, lz = bc._cpp_object.dof_indices()
+                        Aij.zeroRowsLocal(dofs[:lz], diag=on_diagonal)
+        return A
+
+    assert isinstance(a, ufl.Form)
+    num_arguments = len(a.arguments())
     if num_arguments == 2:
         assemble_matrix_and_apply_restriction(
             A,
@@ -58,31 +85,31 @@ def assemble_matrix(
                 dofs, lz = bc._cpp_object.dof_indices()
                 A.zeroRowsLocal(dofs[:lz], diag=on_diagonal)
         return A
-    else:
-        bilinear_form = ufl.extract_blocks(a)
-        num_spaces = len(bilinear_form)
-        for i in range(num_spaces):
-            for j in range(num_spaces):
-                Aij = A.getNestSubMatrix(i, j)  # type: ignore
-                if bilinear_form[i][j] is not None:
-                    assemble_matrix_and_apply_restriction(
-                        Aij,
-                        bilinear_form[i][j],
-                        form_compiler_options=form_compiler_options,
-                        jit_options=jit_options,
-                        entity_maps=entity_maps,
-                    )
-                    # Unsymmetric application of Dirichlet BCs
-                    spaces = [
-                        arg.ufl_function_space()._cpp_object
-                        for arg in bilinear_form[i][j].arguments()
-                    ]
-                    on_diagonal = float(spaces[0] == spaces[1])
-                    for bc in bcs:
-                        if bc.function_space == spaces[0]:
-                            dofs, lz = bc._cpp_object.dof_indices()
-                            Aij.zeroRowsLocal(dofs[:lz], diag=on_diagonal)
-        return A  # type: ignore
+
+    bilinear_form = ufl.extract_blocks(a)
+    num_spaces = len(bilinear_form)
+    for i in range(num_spaces):
+        for j in range(num_spaces):
+            Aij = A.getNestSubMatrix(i, j)  # type: ignore[attr-defined]
+            if bilinear_form[i][j] is not None:
+                assemble_matrix_and_apply_restriction(
+                    Aij,
+                    bilinear_form[i][j],
+                    form_compiler_options=form_compiler_options,
+                    jit_options=jit_options,
+                    entity_maps=entity_maps,
+                )
+                # Unsymmetric application of Dirichlet BCs
+                spaces = [
+                    arg.ufl_function_space()._cpp_object
+                    for arg in bilinear_form[i][j].arguments()
+                ]
+                on_diagonal = float(spaces[0] == spaces[1])
+                for bc in bcs:
+                    if bc.function_space == spaces[0]:
+                        dofs, lz = bc._cpp_object.dof_indices()
+                        Aij.zeroRowsLocal(dofs[:lz], diag=on_diagonal)
+    return A
 
 
 def assemble_matrix_and_apply_restriction(
@@ -293,7 +320,7 @@ def create_submatrix(
 
 
 def create_matrix(
-    a: ufl.Form,
+    a: ufl.Form | Sequence[Sequence[ufl.Form | None]],
     form_compiler_options: dict | None = None,
     jit_options: dict | None = None,
     entity_maps: typing.Sequence[dolfinx.mesh.EntityMap] | None = None,
@@ -310,22 +337,45 @@ def create_matrix(
         form_compiler_options: Options to pass to the form compiler.
         jit_options: Options to pass to the JIT compiler.
     """
+    if isinstance(a, Sequence) and not isinstance(a, ufl.Form):
+        if len(a) == 0:
+            raise ValueError("Cannot create matrix from an empty nested form sequence.")
+        num_cols = len(a[0])
+        A = [[None for _ in range(num_cols)] for _ in range(len(a))]
+        for i, row in enumerate(a):
+            if not isinstance(row, Sequence):
+                raise ValueError("Nested matrix form input must be row-wise sequences.")
+            if len(row) != num_cols:
+                raise ValueError(
+                    "All rows in nested matrix form input must have equal length."
+                )
+            for j, block in enumerate(row):
+                if block is not None:
+                    A[i][j] = create_submatrix(
+                        block,
+                        form_compiler_options,
+                        jit_options,
+                        entity_maps=entity_maps,
+                    )
+        return PETSc.Mat().createNest(A)  # type: ignore[attr-defined]
+
+    assert isinstance(a, ufl.Form)
     num_arguments = len(a.arguments())
     if num_arguments == 2:
         return create_submatrix(
             a, form_compiler_options, jit_options, entity_maps=entity_maps
         )
-    else:
-        bilinear_form = ufl.extract_blocks(a)
-        num_spaces = len(bilinear_form)
-        A = [[None for _ in range(num_spaces)] for _ in range(num_spaces)]
-        for i in range(num_spaces):
-            for j in range(num_spaces):
-                if bilinear_form[i][j] is not None:
-                    A[i][j] = create_submatrix(
-                        bilinear_form[i][j],
-                        form_compiler_options,
-                        jit_options,
-                        entity_maps=entity_maps,
-                    )
-        return PETSc.Mat().createNest(A)  # type: ignore
+
+    bilinear_form = ufl.extract_blocks(a)
+    num_spaces = len(bilinear_form)
+    A = [[None for _ in range(num_spaces)] for _ in range(num_spaces)]
+    for i in range(num_spaces):
+        for j in range(num_spaces):
+            if bilinear_form[i][j] is not None:
+                A[i][j] = create_submatrix(
+                    bilinear_form[i][j],
+                    form_compiler_options,
+                    jit_options,
+                    entity_maps=entity_maps,
+                )
+    return PETSc.Mat().createNest(A)  # type: ignore[attr-defined]
