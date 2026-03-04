@@ -46,11 +46,14 @@ from dolfinx.fem.bcs import DirichletBC
 from dolfinx.fem.bcs import bcs_by_block as _bcs_by_block
 from dolfinx.fem.forms import Form, derivative_block
 from dolfinx.fem.forms import extract_function_spaces as _extract_function_spaces
+from dolfinx.fem.forms import form as _create_form
 from dolfinx.fem.function import Function as _Function
 from dolfinx.mesh import EntityMap as _EntityMap
 
+from .assembly import average_coefficients
 from .matrix_assembler import assemble_matrix
 from .matrix_assembler import create_matrix
+from .ufl_operations import apply_replacer
 from .vector_assembler import assemble_vector
 from .vector_assembler import create_vector
 
@@ -62,7 +65,6 @@ __all__ = [
     "assign",
     "set_bc",
 ]
-
 
 
 # -- Modifiers for Dirichlet conditions -----------------------------------
@@ -135,11 +137,16 @@ def apply_lifting(
     """
     if b.getType() == PETSc.Vec.Type.NEST:  # type: ignore[attr-defined]
         x0 = [] if x0 is None else x0.getNestSubVecs()  # type: ignore[attr-defined]
-        constants = [pack_constants(forms) for forms in a] if constants is None else constants  # type: ignore[assignment]
+        constants = (
+            [pack_constants(forms) for forms in a] if constants is None else constants
+        )  # type: ignore[assignment]
         coeffs = [pack_coefficients(forms) for forms in a] if coeffs is None else coeffs  # type: ignore[misc]
         for b_sub, a_sub, const, coeff in zip(b.getNestSubVecs(), a, constants, coeffs):  # type: ignore[arg-type]
             const_ = list(
-                map(lambda x: np.array([], dtype=PETSc.ScalarType) if x is None else x, const)  # type: ignore[attr-defined, call-overload]
+                map(
+                    lambda x: np.array([], dtype=PETSc.ScalarType) if x is None else x,
+                    const,
+                )  # type: ignore[attr-defined, call-overload]
             )
             apply_lifting(b_sub, a_sub, bcs, x0, alpha, const_, coeff)  # type: ignore[arg-type]
     else:
@@ -162,14 +169,18 @@ def apply_lifting(
                     for i, (a_, off0, off1, offg0, offg1) in enumerate(
                         zip(a, offset0, offset0[1:], offset1, offset1[1:])
                     ):
-                        const = pack_constants(a_) if constants is None else constants[i]  # type: ignore[arg-type]
+                        const = (
+                            pack_constants(a_) if constants is None else constants[i]
+                        )  # type: ignore[arg-type]
                         coeff = pack_coefficients(a_) if coeffs is None else coeffs[i]  # type: ignore[arg-type, assignment, index]
                         const_ = [
                             np.empty(0, dtype=PETSc.ScalarType) if val is None else val  # type: ignore[attr-defined]
                             for val in const
                         ]
                         bx_ = np.concatenate((b_l[off0:off1], b_l[offg0:offg1]))
-                        _apply_lifting(bx_, a_, bcs, xlocal, float(alpha), const_, coeff)  # type: ignore[arg-type]
+                        _apply_lifting(
+                            bx_, a_, bcs, xlocal, float(alpha), const_, coeff
+                        )  # type: ignore[arg-type]
                         size = off1 - off0
                         b_l.array_w[off0:off1] = bx_[:size]
                         b_l.array_w[offg0:offg1] = bx_[size:]
@@ -236,11 +247,13 @@ def set_bc(
 def assemble_residual(
     u: _Function | Sequence[_Function],
     residual: ufl.Form,
-    jacobian: Form | Sequence[Sequence[Form]],
+    jacobian: Form | ufl.Form | Sequence[Sequence[Form]],
     bcs: Sequence[DirichletBC],
     _snes: PETSc.SNES,  # type: ignore[name-defined]
     x: PETSc.Vec,  # type: ignore[name-defined]
     b: PETSc.Vec,  # type: ignore[name-defined]
+    lifting_forms: Sequence[Form] | None = None,
+    lifting_forms_ufl: Sequence[ufl.Form] | None = None,
 ):
     """Assemble the residual at ``x`` into the vector ``b``.
 
@@ -267,7 +280,9 @@ def assemble_residual(
         b: Vector to assemble the residual into.
     """
     # Update input vector before assigning
-    dolfinx.la.petsc._ghost_update(x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore[attr-defined]
+    dolfinx.la.petsc._ghost_update(
+        x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
+    )  # type: ignore[attr-defined]
 
     # Assign the input vector to the unknowns
     assign(x, u)
@@ -283,41 +298,57 @@ def assemble_residual(
     if isinstance(jacobian, Sequence):
         # Nest and blocked lifting
         bcs1 = _bcs_by_block(_extract_function_spaces(jacobian, 1), bcs)  # type: ignore[arg-type]
-        if all((form is None) or hasattr(form, "_cpp_object") for row in jacobian for form in row):  # type: ignore[arg-type]
-            apply_lifting(b, jacobian, bcs=bcs1, x0=x, alpha=-1.0)
-            dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[attr-defined]
-        bcs0 = _bcs_by_block(_extract_function_spaces(residual), bcs)  # type: ignore[arg-type]
-        set_bc(b, bcs0, x0=x, alpha=-1.0)
+        if bcs:
+            if all(
+                (form is None) or hasattr(form, "_cpp_object")
+                for row in jacobian
+                for form in row
+            ):  # type: ignore[arg-type]
+                apply_lifting(b, jacobian, bcs=bcs1, x0=x, alpha=-1.0)
+                dolfinx.la.petsc._ghost_update(
+                    b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
+                )  # type: ignore[attr-defined]
+            else:
+                raise RuntimeError(
+                    "Dirichlet residual lifting for block/nest problems requires "
+                    "compiled Jacobian blocks; algebraic lifting fallback is disabled."
+                )
+            bcs0 = _bcs_by_block(_extract_function_spaces(residual), bcs)  # type: ignore[arg-type]
+            set_bc(b, bcs0, x0=x, alpha=-1.0)
     else:
         # Single form lifting
-        if hasattr(jacobian, "_cpp_object"):
-            apply_lifting(b, [jacobian], bcs=[bcs], x0=[x], alpha=-1.0)
-            dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[attr-defined]
-        else:
-            # Fallback for UFL-only Jacobians: build a temporary Jacobian and
-            # apply lifting algebraically: b <- b - J*(g - x)
-            J_tmp = create_matrix(jacobian)
-            J_tmp.zeroEntries()
-            assemble_matrix(jacobian, bcs=bcs, A=J_tmp)
-            J_tmp.assemble()
+        if bcs:
+            if lifting_forms is not None:
+                # apply_lifting expects one x0/bcs block per bilinear form.
+                # For split/replaced forms we apply lifting contribution form-wise.
+                if lifting_forms_ufl is None:
+                    form_pairs = [
+                        (lifting_form, None) for lifting_form in lifting_forms
+                    ]
+                else:
+                    form_pairs = list(zip(lifting_forms, lifting_forms_ufl))
 
-            dx_bc = b.duplicate()
-            dolfinx.la.petsc._zero_vector(dx_bc)
-            set_bc(dx_bc, bcs, x0=x, alpha=-1.0)
-            dolfinx.la.petsc._ghost_update(
-                dx_bc, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
-            )  # type: ignore[attr-defined]
-
-            lift = b.duplicate()
-            dolfinx.la.petsc._zero_vector(lift)
-            J_tmp.mult(dx_bc, lift)
-            b.axpy(-1.0, lift)
-
-            J_tmp.destroy()
-            dx_bc.destroy()
-            lift.destroy()
-        set_bc(b, bcs, x0=x, alpha=-1.0)
-    dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore[attr-defined]
+                for lifting_form, lifting_form_ufl in form_pairs:
+                    if lifting_form_ufl is not None:
+                        average_coefficients(lifting_form_ufl)
+                    apply_lifting(b, [lifting_form], bcs=[bcs], x0=[x], alpha=-1.0)
+                dolfinx.la.petsc._ghost_update(
+                    b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
+                )  # type: ignore[attr-defined]
+            elif hasattr(jacobian, "_cpp_object"):
+                apply_lifting(b, [jacobian], bcs=[bcs], x0=[x], alpha=-1.0)
+                dolfinx.la.petsc._ghost_update(
+                    b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
+                )  # type: ignore[attr-defined]
+            else:
+                raise RuntimeError(
+                    "Dirichlet residual lifting requires a compiled Jacobian form; "
+                    "algebraic lifting fallback is disabled."
+                )
+            set_bc(b, bcs, x0=x, alpha=-1.0)
+    dolfinx.la.petsc._ghost_update(
+        b, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
+    )  # type: ignore[attr-defined]
 
 
 def assemble_jacobian(
@@ -358,7 +389,9 @@ def assemble_jacobian(
     """
     # Copy existing soultion into the function used in the residual and
     # Jacobian
-    dolfinx.la.petsc._ghost_update(x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore[attr-defined]
+    dolfinx.la.petsc._ghost_update(
+        x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
+    )  # type: ignore[attr-defined]
     assign(x, u)
 
     # Assemble Jacobian
@@ -482,14 +515,88 @@ class NonlinearProblem:
             J = derivative_block(F, u)
         self._J_ufl = J
         self._preconditioner_ufl = P
+        bcs = [] if bcs is None else bcs
 
         # Keep residual in UFL form. It may contain custom operators
         # (e.g. Average) that are not directly compilable by FFCx.
         self._F = F
 
-        # Keep Jacobian in UFL form for the custom fenicsx_ii assembly path.
-        # Compiling here can fail when forms contain custom operators.
-        self._J = J
+        # Prefer a compiled Jacobian form for lifting in residual assembly.
+        # For custom operators that FFCx cannot process directly, compile
+        # the apply_replacer-transformed Jacobian contributions instead.
+        self._J_lifting: Sequence[Form] | None = None
+        self._J_lifting_ufl: Sequence[ufl.Form] | None = None
+        direct_compile_error: Exception | None = None
+        replacer_compile_error: Exception | None = None
+        try:
+            self._J = _create_form(
+                J,
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
+            if isinstance(self._J, Form):
+                self._J_lifting = [self._J]
+        except Exception as exc:
+            direct_compile_error = exc
+            self._J = J
+            if isinstance(J, ufl.Form):
+                try:
+                    replaced_forms = apply_replacer(J)
+                    self._J_lifting_ufl = replaced_forms
+                    self._J_lifting = [
+                        _create_form(
+                            j_form,
+                            form_compiler_options=form_compiler_options,
+                            jit_options=jit_options,
+                            entity_maps=entity_maps,
+                        )
+                        for j_form in replaced_forms
+                    ]
+                except Exception as exc_replaced:
+                    replacer_compile_error = exc_replaced
+                    self._J_lifting = None
+                    self._J_lifting_ufl = None
+
+        def _has_compiled_lifting_path() -> bool:
+            if isinstance(self._J, Sequence):
+                return all(
+                    (form is None) or hasattr(form, "_cpp_object")
+                    for row in self._J
+                    for form in row
+                )
+
+            if hasattr(self._J, "_cpp_object"):
+                return True
+
+            return (
+                self._J_lifting is not None
+                and len(self._J_lifting) > 0
+                and all(hasattr(j_form, "_cpp_object") for j_form in self._J_lifting)
+            )
+
+        if bcs and not _has_compiled_lifting_path():
+            diagnostics = []
+            if direct_compile_error is not None:
+                diagnostics.append(
+                    "direct Jacobian compilation failed: "
+                    f"{type(direct_compile_error).__name__}: {direct_compile_error}"
+                )
+            if replacer_compile_error is not None:
+                diagnostics.append(
+                    "replacer Jacobian compilation failed: "
+                    f"{type(replacer_compile_error).__name__}: {replacer_compile_error}"
+                )
+            if not diagnostics:
+                diagnostics.append("no compiled Jacobian lifting forms were produced")
+
+            error = RuntimeError(
+                "Dirichlet residual lifting requires compiled Jacobian form(s); "
+                "algebraic lifting fallback is disabled. Compile the Jacobian "
+                "directly or make apply_replacer(J) compilable.\n"
+                "Compilation diagnostics:\n- " + "\n- ".join(diagnostics)
+            )
+            raise error from (replacer_compile_error or direct_compile_error)
 
         if P is not None:
             self._preconditioner = P
@@ -497,8 +604,6 @@ class NonlinearProblem:
             self._preconditioner = None
 
         self._u = u
-        # Set default values if not supplied
-        bcs = [] if bcs is None else bcs
 
         # Create PETSc structures for the residual, Jacobian and solution
         # vector
@@ -540,7 +645,18 @@ class NonlinearProblem:
             self.A,
             self.P_mat,
         )
-        self.solver.setFunction(partial(assemble_residual, u, self._F_ufl, self.J, bcs), self.b)
+        self.solver.setFunction(
+            partial(
+                assemble_residual,
+                u,
+                self._F_ufl,
+                self.J,
+                bcs,
+                lifting_forms=self._J_lifting,
+                lifting_forms_ufl=self._J_lifting_ufl,
+            ),
+            self.b,
+        )
 
         if petsc_options_prefix == "":
             raise ValueError("PETSc options prefix cannot be empty.")
@@ -601,7 +717,9 @@ class NonlinearProblem:
 
         # Solve problem
         self.solver.solve(None, self.x)
-        dolfinx.la.petsc._ghost_update(self.x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD)  # type: ignore[attr-defined]
+        dolfinx.la.petsc._ghost_update(
+            self.x, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
+        )  # type: ignore[attr-defined]
 
         # Copy solution back to function
         assign(self.x, self.u)

@@ -9,11 +9,19 @@ from fenicsx_ii import Average, MappedRestriction
 
 import ufl
 from dolfinx import default_real_type
-from dolfinx.fem import Function, dirichletbc, form, functionspace, locate_dofs_geometrical
+from dolfinx.fem import (
+    Function,
+    dirichletbc,
+    form,
+    functionspace,
+    locate_dofs_geometrical,
+)
 from dolfinx.fem.forms import extract_function_spaces
 from dolfinx.mesh import create_unit_square
 from ufl import TestFunction, TrialFunction, derivative, dx, grad, inner
 from fenicsx_ii import NonlinearProblem
+from fenicsx_ii.petsc import assemble_jacobian, assemble_residual
+import fenicsx_ii.petsc as fenicsx_ii_petsc
 import dolfinx
 from petsc4py import PETSc
 
@@ -22,7 +30,7 @@ petsc_options_linear = {
     "ksp_type": "preonly",
     "pc_type": "lu",
     "pc_factor_mat_solver_type": "mumps",
-    "ksp_error_if_not_converged": True
+    "ksp_error_if_not_converged": True,
 }
 
 petsc_options_nonlinear = {
@@ -30,8 +38,219 @@ petsc_options_nonlinear = {
     "snes_rtol": 10 * np.finfo(PETSc.ScalarType).eps,  # type: ignore[attr-defined]
     "snes_max_it": 10,
     "snes_monitor": None,
-    "snes_error_if_not_converged": True
+    "snes_error_if_not_converged": True,
 }
+
+
+def _build_dirichlet_laplace_problem(
+    bc_value: float, prefix: str
+) -> tuple[
+    dolfinx.mesh.Mesh,
+    dolfinx.fem.FunctionSpace,
+    dolfinx.fem.Function,
+    dolfinx.fem.Function,
+    ufl.Form,
+    dolfinx.fem.DirichletBC,
+    NonlinearProblem,
+]:
+    """Create a simple nonlinear problem used to inspect BC handling in callbacks."""
+    msh, V, u, u_D, F, J, bc = _build_dirichlet_laplace_forms_and_bc(bc_value)
+    problem = NonlinearProblem(F, u, J=J, bcs=[bc], petsc_options_prefix=prefix)
+    return msh, V, u, u_D, J, bc, problem
+
+
+def _build_dirichlet_laplace_forms_and_bc(
+    bc_value: float,
+) -> tuple[
+    dolfinx.mesh.Mesh,
+    dolfinx.fem.FunctionSpace,
+    dolfinx.fem.Function,
+    dolfinx.fem.Function,
+    ufl.Form,
+    ufl.Form,
+    dolfinx.fem.DirichletBC,
+]:
+    """Create a simple scalar Laplace form with global Dirichlet boundary condition."""
+    msh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 6, 6)
+    V = dolfinx.fem.functionspace(msh, ("Lagrange", 1))
+    u = dolfinx.fem.Function(V)
+    v = ufl.TestFunction(V)
+    F = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+    J = ufl.derivative(F, u, ufl.TrialFunction(V))
+
+    u_D = dolfinx.fem.Function(V)
+    u_D.interpolate(lambda x: np.full(x.shape[1], bc_value, dtype=default_real_type))
+    fdim = msh.topology.dim - 1
+    boundary_facets = dolfinx.mesh.locate_entities_boundary(
+        msh, fdim, lambda x: np.full(x.shape[1], True, dtype=bool)
+    )
+    dofs_bc = dolfinx.fem.locate_dofs_topological(V, fdim, boundary_facets)
+    bc = dolfinx.fem.dirichletbc(u_D, dofs_bc)
+    return msh, V, u, u_D, F, J, bc
+
+
+def test_dirichlet_residual_boundary_rows_are_x_minus_g() -> None:
+    """Residual callback should set constrained rows to x-g."""
+    msh, _V, _u, _u_D, _J, bc, problem = _build_dirichlet_laplace_problem(
+        bc_value=1.25, prefix="test_dirichlet_residual_boundary_rows_are_x_minus_g_"
+    )
+
+    # Evaluate residual at x=0 so constrained rows should be -g.
+    with problem.x.localForm() as x_loc:
+        x_loc.set(0.0)
+    assemble_residual(
+        problem.u, problem.F, problem.J, [bc], problem.solver, problem.x, problem.b
+    )
+
+    dofs, lz = bc._cpp_object.dof_indices()
+    with problem.b.localForm() as b_loc:
+        b_array = np.array(b_loc.array_r, copy=True)
+
+    bc_owned = dofs[:lz]
+    expected = np.full(len(bc_owned), -1.25, dtype=b_array.dtype)
+    np.testing.assert_allclose(
+        b_array[bc_owned], expected, atol=1e4 * np.finfo(default_real_type).eps
+    )
+
+
+def test_dirichlet_residual_applies_lifting_to_interior_rows() -> None:
+    """Interior residual entries should be affected by lifting for non-zero BCs."""
+    msh, V, _u, _u_D, _J, bc, problem = _build_dirichlet_laplace_problem(
+        bc_value=2.0, prefix="test_dirichlet_residual_applies_lifting_to_interior_rows_"
+    )
+
+    with problem.x.localForm() as x_loc:
+        x_loc.set(0.0)
+    assemble_residual(
+        problem.u, problem.F, problem.J, [bc], problem.solver, problem.x, problem.b
+    )
+
+    dofs, lz = bc._cpp_object.dof_indices()
+    owned_bc = dofs[:lz]
+    num_owned = V.dofmap.index_map.size_local * V.dofmap.bs
+    interior_owned = np.setdiff1d(
+        np.arange(num_owned, dtype=np.int32),
+        owned_bc.astype(np.int32),
+        assume_unique=False,
+    )
+    with problem.b.localForm() as b_loc:
+        b_array = np.array(b_loc.array_r, copy=True)
+
+    local_norm = (
+        float(np.linalg.norm(b_array[interior_owned]))
+        if len(interior_owned) > 0
+        else 0.0
+    )
+    global_norm = msh.comm.allreduce(local_norm, op=MPI.SUM)
+    assert global_norm > 1e3 * np.finfo(default_real_type).eps
+
+
+def test_dirichlet_jacobian_zeroes_boundary_rows() -> None:
+    """Jacobian callback should enforce identity rows at constrained dofs."""
+    msh, V, _u, _u_D, J_ufl, bc, problem = _build_dirichlet_laplace_problem(
+        bc_value=0.5, prefix="test_dirichlet_jacobian_zeroes_boundary_rows_"
+    )
+
+    with problem.x.localForm() as x_loc:
+        x_loc.set(0.0)
+    assemble_jacobian(
+        problem.u, J_ufl, None, [bc], problem.solver, problem.x, problem.A, problem.A
+    )
+
+    dofs, lz = bc._cpp_object.dof_indices()
+    owned_local = dofs[:lz].astype(np.int32, copy=False)
+    owned_global = V.dofmap.index_map.local_to_global(owned_local)
+
+    local_ok = 1
+    local_checked = 0
+    for gdof in owned_global:
+        cols, vals = problem.A.getRow(int(gdof))
+        local_checked += 1
+        if not (len(cols) == 1 and cols[0] == int(gdof) and np.isclose(vals[0], 1.0)):
+            local_ok = 0
+        if hasattr(problem.A, "restoreRow"):
+            problem.A.restoreRow(int(gdof), cols, vals)
+
+    checked = msh.comm.allreduce(local_checked, op=MPI.SUM)
+    ok = msh.comm.allreduce(local_ok, op=MPI.MIN)
+    assert checked > 0
+    assert ok == 1
+
+
+def test_residual_raises_without_compiled_lifting_path() -> None:
+    """Residual assembly must fail for BC lifting without compiled Jacobian forms."""
+    _msh, _V, _u, _u_D, J_ufl, bc, problem = _build_dirichlet_laplace_problem(
+        bc_value=0.0, prefix="test_residual_raises_without_compiled_lifting_path_"
+    )
+
+    with problem.x.localForm() as x_loc:
+        x_loc.set(0.0)
+
+    with pytest.raises(RuntimeError, match="algebraic lifting fallback is disabled"):
+        assemble_residual(
+            problem.u,
+            problem.F,
+            J_ufl,
+            [bc],
+            problem.solver,
+            problem.x,
+            problem.b,
+        )
+
+
+def test_constructor_raises_if_lifting_forms_cannot_be_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construction must fail fast with BCs when no compiled lifting path exists."""
+    _msh, _V, u, _u_D, F, J_ufl, bc = _build_dirichlet_laplace_forms_and_bc(1.0)
+
+    def _raise_create_form(*args, **kwargs):
+        raise RuntimeError("forced _create_form failure")
+
+    def _raise_apply_replacer(*args, **kwargs):
+        raise RuntimeError("forced apply_replacer failure")
+
+    monkeypatch.setattr(fenicsx_ii_petsc, "_create_form", _raise_create_form)
+    monkeypatch.setattr(fenicsx_ii_petsc, "apply_replacer", _raise_apply_replacer)
+
+    with pytest.raises(
+        RuntimeError, match="algebraic lifting fallback is disabled"
+    ) as excinfo:
+        NonlinearProblem(
+            F,
+            u,
+            J=J_ufl,
+            bcs=[bc],
+            petsc_options_prefix="test_constructor_raises_if_lifting_forms_cannot_be_compiled_",
+        )
+
+    assert "direct Jacobian compilation failed" in str(excinfo.value)
+    assert "replacer Jacobian compilation failed" in str(excinfo.value)
+
+
+def test_constructor_allows_uncompiled_jacobian_without_bcs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-BC problems should remain constructible even if lifting compilation fails."""
+    _msh, _V, u, _u_D, F, J_ufl, _bc = _build_dirichlet_laplace_forms_and_bc(1.0)
+
+    def _raise_create_form(*args, **kwargs):
+        raise RuntimeError("forced _create_form failure")
+
+    def _raise_apply_replacer(*args, **kwargs):
+        raise RuntimeError("forced apply_replacer failure")
+
+    monkeypatch.setattr(fenicsx_ii_petsc, "_create_form", _raise_create_form)
+    monkeypatch.setattr(fenicsx_ii_petsc, "apply_replacer", _raise_apply_replacer)
+
+    problem = NonlinearProblem(
+        F,
+        u,
+        J=J_ufl,
+        bcs=[],
+        petsc_options_prefix="test_constructor_allows_uncompiled_jacobian_without_bcs_",
+    )
+    assert problem is not None
 
 
 def test_plain_nonlinear_solver() -> None:
@@ -45,7 +264,8 @@ def test_plain_nonlinear_solver() -> None:
     x = ufl.SpatialCoordinate(mesh)
     f = x[0] + 3 * x[1]
     F = (
-        ufl.inner(u, v) * dx + 0.001 * ufl.inner(u**2 - f * u, v) * dx
+        ufl.inner(u, v) * dx
+        + 0.001 * ufl.inner(u**2 - f * u, v) * dx
         - ufl.inner(f, v) * dx
     )
     # Define boundary conditions
@@ -54,17 +274,27 @@ def test_plain_nonlinear_solver() -> None:
     f_bc.interpolate(f_expr)
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
     boundary_facets = dolfinx.mesh.locate_entities_boundary(
-        mesh, mesh.topology.dim - 1, lambda x: np.isclose(x[1], 1.0))
-    dofs_bc = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+        mesh, mesh.topology.dim - 1, lambda x: np.isclose(x[1], 1.0)
+    )
+    dofs_bc = dolfinx.fem.locate_dofs_topological(
+        V, mesh.topology.dim - 1, boundary_facets
+    )
     bcs = [dolfinx.fem.dirichletbc(f_bc, dofs_bc)]
     # Solve
     problem = NonlinearProblem(
-        F, u, bcs=bcs, petsc_options_prefix="test_plain_nonlinear_solver_", petsc_options=petsc_options_nonlinear)
+        F,
+        u,
+        bcs=bcs,
+        petsc_options_prefix="test_plain_nonlinear_solver_",
+        petsc_options=petsc_options_nonlinear,
+    )
     problem.solve()
     assert problem.solver.getConvergedReason() > 0
     # Compute error
     error_ufl = dolfinx.fem.form(ufl.inner(u - f, u - f) * dx)
-    error = np.sqrt(mesh.comm.allreduce(dolfinx.fem.assemble_scalar(error_ufl), op=MPI.SUM))
+    error = np.sqrt(
+        mesh.comm.allreduce(dolfinx.fem.assemble_scalar(error_ufl), op=MPI.SUM)
+    )
     tol = 500 * np.finfo(PETSc.ScalarType).eps  # type: ignore[attr-defined]
     assert error < tol
 
@@ -76,15 +306,14 @@ def test_nonlinear_poisson(linear=False):
         if linear:
             return 1
 
-        return 1 + u*u
+        return 1 + u * u
 
     msh1 = mesh.create_unit_square(
-        MPI.COMM_WORLD, 10, 10,
-        cell_type=mesh.CellType.triangle
+        MPI.COMM_WORLD, 10, 10, cell_type=mesh.CellType.triangle
     )
 
     # create second mesh [4,3] \times [5,4]
-    translation_vector = np.array([4., 3.])
+    translation_vector = np.array([4.0, 3.0])
     msh2 = mesh.create_rectangle(
         MPI.COMM_WORLD,
         [translation_vector, translation_vector + np.ones(2)],
@@ -92,22 +321,25 @@ def test_nonlinear_poisson(linear=False):
         cell_type=mesh.CellType.quadrilateral,
     )
 
-    def translate_domain_to_domain2(x):
+    def translate_msh1_to_msh2(x):
         x_out = x.copy()
         for i, ti in enumerate(translation_vector):
             x_out[i] += ti
         return x_out
 
-    restriction = MappedRestriction(msh1, translate_domain_to_domain2)
+    restriction = MappedRestriction(msh1, translate_msh1_to_msh2)
 
     def g(x):
-        return x[0] + 2 * x[1] * x[1]
+        return x[0] + 2 * x[1]
 
     x1 = ufl.SpatialCoordinate(msh1)
     u_ufl = 1 + x1[0] + 2 * x1[1]
-    f = -ufl.div(q(u_ufl) * ufl.grad(u_ufl)) - g(x1 + ufl.as_vector(translation_vector.tolist()))
+    f = -ufl.div(q(u_ufl) * ufl.grad(u_ufl)) - g(
+        x1 + ufl.as_vector(translation_vector.tolist())
+    )
 
     V1 = fem.functionspace(msh1, ("Lagrange", 1))
+
     def u_exact(x):
         return eval(str(u_ufl))
 
@@ -135,7 +367,11 @@ def test_nonlinear_poisson(linear=False):
     uh = fem.Function(V1)
     v = ufl.TestFunction(V1)
     dx1 = ufl.Measure("dx", domain=msh1)
-    F = q(uh) * ufl.dot(ufl.grad(uh), ufl.grad(v))*dx1 - u_g__on_msh1*v*dx1 - f*v*dx1
+    F = (
+        q(uh) * ufl.dot(ufl.grad(uh), ufl.grad(v)) * dx1
+        - u_g__on_msh1 * v * dx1
+        - f * v * dx1
+    )
 
     petsc_options = {
         "snes_type": "newtonls",
@@ -148,16 +384,20 @@ def test_nonlinear_poisson(linear=False):
         "pc_type": "lu",
     }
     problem = NonlinearProblem(
-        F, uh, bcs=[bc],
+        F,
+        uh,
+        bcs=[bc],
         petsc_options=petsc_options,
-        petsc_options_prefix="nonlinpoisson"
+        petsc_options_prefix="nonlinpoisson",
     )
 
     problem.solve()
     converged = problem.solver.getConvergedReason()
     num_iter = problem.solver.getIterationNumber()
     assert converged > 0, f"Solver did not converge, got {converged}"
-    assert num_iter <= 11, f"Solver did not converge within 8 iterations, took {num_iter}"
+    assert num_iter <= 11, (
+        f"Solver did not converge within 8 iterations, took {num_iter}"
+    )
     print(
         f"Solver converged after {num_iter} iterations with converged reason {converged}"
     )
@@ -168,23 +408,26 @@ def test_nonlinear_poisson(linear=False):
     u_ex.interpolate(u_exact)
     error_local = fem.assemble_scalar(fem.form((uh - u_ex) ** 2 * ufl.dx))
     error_L2 = np.sqrt(msh1.comm.allreduce(error_local, op=MPI.SUM))
-    if msh1.comm.rank == 0:
-        print(f"L2-error: {error_L2:.2e}")
-        assert error_L2 < 1e-4
 
     # Compute values at mesh vertices
     error_max = msh1.comm.allreduce(
         np.max(np.abs(uh.x.array - u_D.x.array)), op=MPI.MAX
     )
     if msh1.comm.rank == 0:
+        if linear:
+            tol = 500 * np.finfo(PETSc.ScalarType).eps  # type: ignore[attr-defined]
+        else:
+            tol = np.sqrt(np.finfo(PETSc.ScalarType).eps)
+        print(f"L2-error: {error_L2:.2e}")
         print(f"Error_max: {error_max:.2e}")
-        assert error_max < 1e-4
+        print(f"Tol: {tol}")
+        assert error_max < tol, "Max error too large"
 
 
 def test_linear_poisson():
     test_nonlinear_poisson(linear=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_nonlinear_poisson()
     test_linear_poisson()
