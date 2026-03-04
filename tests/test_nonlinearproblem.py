@@ -22,6 +22,7 @@ from ufl import TestFunction, TrialFunction, derivative, dx, grad, inner
 from fenicsx_ii import NonlinearProblem
 from fenicsx_ii.petsc import assemble_jacobian, assemble_residual
 import fenicsx_ii.petsc as fenicsx_ii_petsc
+import fenicsx_ii.forms as fenicsx_ii_forms
 import dolfinx
 from petsc4py import PETSc
 
@@ -147,14 +148,14 @@ def test_dirichlet_residual_applies_lifting_to_interior_rows() -> None:
 
 def test_dirichlet_jacobian_zeroes_boundary_rows() -> None:
     """Jacobian callback should enforce identity rows at constrained dofs."""
-    msh, V, _u, _u_D, J_ufl, bc, problem = _build_dirichlet_laplace_problem(
+    msh, V, _u, _u_D, _J_ufl, bc, problem = _build_dirichlet_laplace_problem(
         bc_value=0.5, prefix="test_dirichlet_jacobian_zeroes_boundary_rows_"
     )
 
     with problem.x.localForm() as x_loc:
         x_loc.set(0.0)
     assemble_jacobian(
-        problem.u, J_ufl, None, [bc], problem.solver, problem.x, problem.A, problem.A
+        problem.u, problem.J, None, [bc], problem.solver, problem.x, problem.A, problem.A
     )
 
     dofs, lz = bc._cpp_object.dof_indices()
@@ -163,10 +164,17 @@ def test_dirichlet_jacobian_zeroes_boundary_rows() -> None:
 
     local_ok = 1
     local_checked = 0
+    tol = 1e3 * np.finfo(default_real_type).eps
     for gdof in owned_global:
         cols, vals = problem.A.getRow(int(gdof))
         local_checked += 1
-        if not (len(cols) == 1 and cols[0] == int(gdof) and np.isclose(vals[0], 1.0)):
+        diag_val = None
+        for col, val in zip(cols, vals):
+            if int(col) == int(gdof):
+                diag_val = val
+            elif not np.isclose(val, 0.0, atol=tol):
+                local_ok = 0
+        if diag_val is None or not np.isclose(diag_val, 1.0, atol=tol):
             local_ok = 0
         if hasattr(problem.A, "restoreRow"):
             problem.A.restoreRow(int(gdof), cols, vals)
@@ -177,80 +185,139 @@ def test_dirichlet_jacobian_zeroes_boundary_rows() -> None:
     assert ok == 1
 
 
-def test_residual_raises_without_compiled_lifting_path() -> None:
-    """Residual assembly must fail for BC lifting without compiled Jacobian forms."""
-    _msh, _V, _u, _u_D, J_ufl, bc, problem = _build_dirichlet_laplace_problem(
-        bc_value=0.0, prefix="test_residual_raises_without_compiled_lifting_path_"
-    )
-
-    with problem.x.localForm() as x_loc:
-        x_loc.set(0.0)
-
-    with pytest.raises(RuntimeError, match="algebraic lifting fallback is disabled"):
-        assemble_residual(
-            problem.u,
-            problem.F,
-            J_ufl,
-            [bc],
-            problem.solver,
-            problem.x,
-            problem.b,
-        )
-
-
-def test_constructor_raises_if_lifting_forms_cannot_be_compiled(
+def test_constructor_raises_if_dirichlet_has_no_compiled_lifting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Construction must fail fast with BCs when no compiled lifting path exists."""
+    """Construction should fail if Jacobian bundle has no compiled lifting path."""
     _msh, _V, u, _u_D, F, J_ufl, bc = _build_dirichlet_laplace_forms_and_bc(1.0)
 
-    def _raise_create_form(*args, **kwargs):
-        raise RuntimeError("forced _create_form failure")
+    original_compile = fenicsx_ii_petsc.compile_form_bundle
+    direct_F_bundle = original_compile(F)
 
-    def _raise_apply_replacer(*args, **kwargs):
-        raise RuntimeError("forced apply_replacer failure")
+    def _compile_form_bundle_stub(
+        form, form_compiler_options=None, jit_options=None, entity_maps=None
+    ):
+        if isinstance(form, ufl.Form) and len(form.arguments()) == 2:
+            return fenicsx_ii_forms.CompiledFormBundle(
+                direct=None,
+                contributions=[],
+                rank=2,
+                test_space=form.arguments()[0].ufl_function_space(),
+                trial_space=form.arguments()[1].ufl_function_space(),
+            )
+        return direct_F_bundle
 
-    monkeypatch.setattr(fenicsx_ii_petsc, "_create_form", _raise_create_form)
-    monkeypatch.setattr(fenicsx_ii_petsc, "apply_replacer", _raise_apply_replacer)
+    monkeypatch.setattr(fenicsx_ii_petsc, "compile_form_bundle", _compile_form_bundle_stub)
 
-    with pytest.raises(
-        RuntimeError, match="algebraic lifting fallback is disabled"
-    ) as excinfo:
+    with pytest.raises(RuntimeError, match="algebraic lifting fallback is disabled"):
         NonlinearProblem(
             F,
             u,
             J=J_ufl,
             bcs=[bc],
-            petsc_options_prefix="test_constructor_raises_if_lifting_forms_cannot_be_compiled_",
+            petsc_options_prefix="test_constructor_raises_if_dirichlet_has_no_compiled_lifting_",
         )
 
-    assert "direct Jacobian compilation failed" in str(excinfo.value)
-    assert "replacer Jacobian compilation failed" in str(excinfo.value)
 
-
-def test_constructor_allows_uncompiled_jacobian_without_bcs(
+def test_constructor_allows_no_lifting_path_without_bcs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No-BC problems should remain constructible even if lifting compilation fails."""
+    """No-BC problems should not fail on missing Jacobian lifting metadata."""
     _msh, _V, u, _u_D, F, J_ufl, _bc = _build_dirichlet_laplace_forms_and_bc(1.0)
 
-    def _raise_create_form(*args, **kwargs):
-        raise RuntimeError("forced _create_form failure")
+    original_compile = fenicsx_ii_petsc.compile_form_bundle
+    direct_F_bundle = original_compile(F)
 
-    def _raise_apply_replacer(*args, **kwargs):
-        raise RuntimeError("forced apply_replacer failure")
+    def _compile_form_bundle_stub(
+        form, form_compiler_options=None, jit_options=None, entity_maps=None
+    ):
+        if isinstance(form, ufl.Form) and len(form.arguments()) == 2:
+            return fenicsx_ii_forms.CompiledFormBundle(
+                direct=None,
+                contributions=[],
+                rank=2,
+                test_space=form.arguments()[0].ufl_function_space(),
+                trial_space=form.arguments()[1].ufl_function_space(),
+            )
+        return direct_F_bundle
 
-    monkeypatch.setattr(fenicsx_ii_petsc, "_create_form", _raise_create_form)
-    monkeypatch.setattr(fenicsx_ii_petsc, "apply_replacer", _raise_apply_replacer)
+    monkeypatch.setattr(fenicsx_ii_petsc, "compile_form_bundle", _compile_form_bundle_stub)
 
     problem = NonlinearProblem(
         F,
         u,
         J=J_ufl,
         bcs=[],
-        petsc_options_prefix="test_constructor_allows_uncompiled_jacobian_without_bcs_",
+        petsc_options_prefix="test_constructor_allows_no_lifting_path_without_bcs_",
     )
     assert problem is not None
+
+
+def test_average_problem_no_runtime_form_compilation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Solve should not call dolfinx.fem.form once the problem is constructed."""
+    from dolfinx import mesh, fem
+
+    msh1 = mesh.create_unit_square(
+        MPI.COMM_WORLD, 6, 6, cell_type=mesh.CellType.triangle
+    )
+    translation_vector = np.array([1.0, 1.0])
+    msh2 = mesh.create_rectangle(
+        MPI.COMM_WORLD,
+        [translation_vector, translation_vector + np.ones(2)],
+        [10, 10],
+        cell_type=mesh.CellType.quadrilateral,
+    )
+
+    def translate_msh1_to_msh2(x):
+        x_out = x.copy()
+        for i, ti in enumerate(translation_vector):
+            x_out[i] += ti
+        return x_out
+
+    restriction = MappedRestriction(msh1, translate_msh1_to_msh2)
+    V1 = fem.functionspace(msh1, ("Lagrange", 1))
+    V2 = fem.functionspace(msh2, ("Lagrange", 1))
+    u = fem.Function(V1)
+    v = ufl.TestFunction(V1)
+    g_fun = fem.Function(V2)
+    g_fun.interpolate(lambda x: x[0] + x[1])
+
+    quadrature = basix.ufl.quadrature_element(msh1.basix_cell(), value_shape=(), degree=2)
+    Q = fem.functionspace(msh1, quadrature)
+    g_on_msh1 = Average(g_fun, restriction, Q)
+    dx1 = ufl.Measure("dx", domain=msh1)
+    F = ufl.inner((1 + u * u) * ufl.grad(u), ufl.grad(v)) * dx1 - g_on_msh1 * v * dx1
+
+    u_D = fem.Function(V1)
+    u_D.interpolate(lambda x: np.zeros(x.shape[1], dtype=default_real_type))
+    fdim = msh1.topology.dim - 1
+    boundary_facets = mesh.locate_entities_boundary(
+        msh1, fdim, lambda x: np.full(x.shape[1], True, dtype=bool)
+    )
+    bc = fem.dirichletbc(u_D, fem.locate_dofs_topological(V1, fdim, boundary_facets))
+
+    problem = NonlinearProblem(
+        F,
+        u,
+        bcs=[bc],
+        petsc_options_prefix="test_average_problem_no_runtime_form_compilation_",
+        petsc_options={
+            "snes_type": "newtonls",
+            "snes_linesearch_type": "none",
+            "snes_atol": 1e-8,
+            "snes_rtol": 1e-8,
+            "ksp_error_if_not_converged": True,
+            "ksp_type": "preonly",
+            "pc_type": "lu",
+        },
+    )
+
+    def _raise_form(*args, **kwargs):
+        raise RuntimeError("dolfinx.fem.form should not be called during solve")
+
+    monkeypatch.setattr(dolfinx.fem, "form", _raise_form)
+    problem.solve()
+    assert problem.solver.getConvergedReason() > 0
 
 
 def test_plain_nonlinear_solver() -> None:

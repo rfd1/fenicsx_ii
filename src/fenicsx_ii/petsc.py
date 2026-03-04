@@ -44,17 +44,14 @@ from dolfinx.fem import IntegralType, pack_coefficients, pack_constants
 from dolfinx.fem.assemble import apply_lifting as _apply_lifting
 from dolfinx.fem.bcs import DirichletBC
 from dolfinx.fem.bcs import bcs_by_block as _bcs_by_block
-from dolfinx.fem.forms import Form, derivative_block
+from dolfinx.fem.forms import Form
 from dolfinx.fem.forms import extract_function_spaces as _extract_function_spaces
-from dolfinx.fem.forms import form as _create_form
 from dolfinx.fem.function import Function as _Function
 from dolfinx.mesh import EntityMap as _EntityMap
 
-from .assembly import average_coefficients
-from .matrix_assembler import assemble_matrix
+from .assembly import assign_LG_map, average_coefficients
+from .forms import CompiledFormBundle, compile_form_bundle, derivative_block
 from .matrix_assembler import create_matrix
-from .ufl_operations import apply_replacer
-from .vector_assembler import assemble_vector
 from .vector_assembler import create_vector
 
 __all__ = [
@@ -244,16 +241,215 @@ def set_bc(
                 bc.set(b_array[off0:off1], x0_sub, alpha)  # type: ignore[arg-type, union-attr]
 
 
+def _flatten_forms(
+    forms: Form | Sequence[Form] | Sequence[Sequence[Form]] | None,
+) -> list[Form]:
+    if forms is None:
+        return []
+    if isinstance(forms, Form):
+        return [forms]
+
+    flattened: list[Form] = []
+    for sub_form in forms:
+        if sub_form is None:
+            continue
+        if isinstance(sub_form, Sequence):
+            flattened.extend(_flatten_forms(sub_form))
+        elif isinstance(sub_form, Form):
+            flattened.append(sub_form)
+    return flattened
+
+
+def _assemble_compiled_residual(
+    b: PETSc.Vec,  # type: ignore[name-defined]
+    residual: Form | Sequence[Form] | CompiledFormBundle,
+) -> None:
+    if isinstance(residual, CompiledFormBundle):
+        if residual.direct is not None:
+            dolfinx.fem.petsc.assemble_vector(b, residual.direct)
+            return
+
+        for contribution in residual.contributions:
+            if contribution.rank != 1:
+                continue
+            average_coefficients(contribution.ufl_form)
+            b_local = dolfinx.fem.petsc.assemble_vector(contribution.form)
+            b_local.ghostUpdate(
+                addv=PETSc.InsertMode.ADD_VALUES,  # type: ignore[attr-defined]
+                mode=PETSc.ScatterMode.REVERSE,  # type: ignore[attr-defined]
+            )
+
+            if contribution.replacement_indices == ():
+                b.axpy(1.0, b_local)
+            elif contribution.replacement_indices == (0,):
+                if (
+                    contribution.row_operator is None
+                    or contribution.test_space is None
+                ):
+                    raise RuntimeError(
+                        "Missing row mapping data for residual contribution."
+                    )
+                z = dolfinx.fem.petsc.create_vector(contribution.test_space)
+                with z.localForm() as z_loc:
+                    z_loc.set(0.0)
+                contribution.row_operator.mult(b_local, z)
+                b.axpy(1.0, z)
+                z.destroy()
+            else:
+                b_local.destroy()
+                raise RuntimeError(
+                    "Unsupported residual replacement pattern "
+                    f"{contribution.replacement_indices}."
+                )
+            b_local.destroy()
+    else:
+        dolfinx.fem.petsc.assemble_vector(b, residual)
+
+
+def _apply_dirichlet_rows(
+    A: PETSc.Mat,  # type: ignore[name-defined]
+    bcs: Sequence[DirichletBC],
+    test_space: dolfinx.fem.FunctionSpace | None,
+    trial_space: dolfinx.fem.FunctionSpace | None,
+) -> None:
+    if test_space is None or trial_space is None:
+        return
+
+    spaces = [test_space._cpp_object, trial_space._cpp_object]
+    on_diagonal = float(spaces[0] == spaces[1])
+    for bc in bcs:
+        if bc.function_space == spaces[0]:
+            dofs, lz = bc._cpp_object.dof_indices()
+            A.zeroRowsLocal(dofs[:lz], diag=on_diagonal)
+
+
+def _map_matrix_contribution(
+    A_local: PETSc.Mat,  # type: ignore[name-defined]
+    replacement_indices: tuple[int, ...],
+    row_operator: PETSc.Mat | None,  # type: ignore[name-defined]
+    col_operator: PETSc.Mat | None,  # type: ignore[name-defined]
+    test_space: dolfinx.fem.FunctionSpace | None,
+    trial_space: dolfinx.fem.FunctionSpace | None,
+) -> PETSc.Mat:  # type: ignore[name-defined]
+    if replacement_indices == ():
+        return A_local
+
+    if replacement_indices == (0,):
+        if row_operator is None:
+            raise RuntimeError("Missing row operator for matrix contribution.")
+        mapped = row_operator.matMult(A_local)
+    elif replacement_indices == (1,):
+        if col_operator is None:
+            raise RuntimeError("Missing column operator for matrix contribution.")
+        mapped = A_local.matMult(col_operator)
+    elif replacement_indices == (0, 1):
+        if row_operator is None or col_operator is None:
+            raise RuntimeError(
+                "Missing row/column operators for matrix contribution."
+            )
+        Z = row_operator.matMult(A_local)
+        mapped = Z.matMult(col_operator)
+        Z.destroy()
+    else:
+        raise RuntimeError(
+            f"Unsupported matrix replacement pattern {replacement_indices}."
+        )
+
+    if test_space is None or trial_space is None:
+        raise RuntimeError("Missing target spaces for mapped matrix contribution.")
+
+    assign_LG_map(
+        mapped,
+        test_space.dofmap.index_map,
+        trial_space.dofmap.index_map,
+        test_space.dofmap.index_map_bs,
+        trial_space.dofmap.index_map_bs,
+    )
+    return mapped
+
+
+def _assemble_compiled_matrix(
+    A: PETSc.Mat,  # type: ignore[name-defined]
+    form_data: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
+    bcs: Sequence[DirichletBC],
+) -> None:
+    if isinstance(form_data, CompiledFormBundle):
+        if form_data.direct is not None:
+            dolfinx.fem.petsc.assemble_matrix(A, form_data.direct, bcs=bcs, diag=1.0)
+            return
+
+        for contribution in form_data.contributions:
+            if contribution.rank != 2:
+                continue
+            average_coefficients(contribution.ufl_form)
+            A_local = dolfinx.fem.petsc.assemble_matrix(contribution.form)
+            A_local.assemble()
+
+            mapped = _map_matrix_contribution(
+                A_local,
+                contribution.replacement_indices,
+                contribution.row_operator,
+                contribution.col_operator,
+                contribution.test_space,
+                contribution.trial_space,
+            )
+            A.axpy(1.0, mapped)
+            if mapped is not A_local:
+                mapped.destroy()
+            A_local.destroy()
+
+        _apply_dirichlet_rows(A, bcs, form_data.test_space, form_data.trial_space)
+    else:
+        if isinstance(form_data, Sequence) and not isinstance(form_data, Form):
+            is_flat_list = all(
+                (entry is None) or isinstance(entry, Form) for entry in form_data
+            ) and not any(isinstance(entry, Sequence) for entry in form_data)
+            if is_flat_list:
+                test_space = None
+                trial_space = None
+                for entry in form_data:
+                    if entry is None or entry.rank != 2:
+                        continue
+                    if test_space is None:
+                        test_space = entry.function_spaces[0]
+                        trial_space = entry.function_spaces[1]
+                    A_local = dolfinx.fem.petsc.assemble_matrix(entry)
+                    A_local.assemble()
+                    A.axpy(1.0, A_local)
+                    A_local.destroy()
+                _apply_dirichlet_rows(A, bcs, test_space, trial_space)
+                return
+        dolfinx.fem.petsc.assemble_matrix(A, form_data, bcs=bcs, diag=1.0)
+
+
+def _bundle_lifting_pairs(
+    form_data: CompiledFormBundle | Form | Sequence[Form] | Sequence[Sequence[Form]],
+) -> list[tuple[Form, ufl.Form | None]]:
+    if isinstance(form_data, CompiledFormBundle):
+        if form_data.direct is not None:
+            return [
+                (form, None)
+                for form in _flatten_forms(form_data.direct)
+                if form.rank == 2
+            ]
+        return [
+            (contribution.form, contribution.ufl_form)
+            for contribution in form_data.contributions
+            if contribution.rank == 2
+        ]
+    if isinstance(form_data, Form):
+        return [(form_data, None)] if form_data.rank == 2 else []
+    return [(form, None) for form in _flatten_forms(form_data) if form.rank == 2]
+
+
 def assemble_residual(
     u: _Function | Sequence[_Function],
-    residual: ufl.Form,
-    jacobian: Form | ufl.Form | Sequence[Sequence[Form]],
+    residual: Form | Sequence[Form] | CompiledFormBundle,
+    jacobian: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
     bcs: Sequence[DirichletBC],
     _snes: PETSc.SNES,  # type: ignore[name-defined]
     x: PETSc.Vec,  # type: ignore[name-defined]
     b: PETSc.Vec,  # type: ignore[name-defined]
-    lifting_forms: Sequence[Form] | None = None,
-    lifting_forms_ufl: Sequence[ufl.Form] | None = None,
 ):
     """Assemble the residual at ``x`` into the vector ``b``.
 
@@ -287,64 +483,64 @@ def assemble_residual(
     # Assign the input vector to the unknowns
     assign(x, u)
 
-    # Assign block data if block assembly is requested
     # Assemble the residual
     dolfinx.la.petsc._zero_vector(b)
-    # Assemble raw residual first. Dirichlet BC contributions are handled
-    # below via lifting and set_bc in SNES residual assembly.
-    assemble_vector(residual, b=b)
+    _assemble_compiled_residual(b, residual)
 
     # Lift vector
-    if isinstance(jacobian, Sequence):
-        # Nest and blocked lifting
-        bcs1 = _bcs_by_block(_extract_function_spaces(jacobian, 1), bcs)  # type: ignore[arg-type]
-        if bcs:
-            if all(
-                (form is None) or hasattr(form, "_cpp_object")
-                for row in jacobian
-                for form in row
-            ):  # type: ignore[arg-type]
-                apply_lifting(b, jacobian, bcs=bcs1, x0=x, alpha=-1.0)
-                dolfinx.la.petsc._ghost_update(
-                    b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
-                )  # type: ignore[attr-defined]
-            else:
-                raise RuntimeError(
-                    "Dirichlet residual lifting for block/nest problems requires "
-                    "compiled Jacobian blocks; algebraic lifting fallback is disabled."
-                )
-            bcs0 = _bcs_by_block(_extract_function_spaces(residual), bcs)  # type: ignore[arg-type]
-            set_bc(b, bcs0, x0=x, alpha=-1.0)
-    else:
-        # Single form lifting
-        if bcs:
-            if lifting_forms is not None:
-                # apply_lifting expects one x0/bcs block per bilinear form.
-                # For split/replaced forms we apply lifting contribution form-wise.
-                if lifting_forms_ufl is None:
-                    form_pairs = [
-                        (lifting_form, None) for lifting_form in lifting_forms
-                    ]
+    if isinstance(jacobian, Sequence) and not isinstance(jacobian, Form):
+        is_nested = any(isinstance(entry, Sequence) for entry in jacobian)
+        if is_nested:
+            # Nest and blocked lifting
+            bcs1 = _bcs_by_block(_extract_function_spaces(jacobian, 1), bcs)  # type: ignore[arg-type]
+            if bcs:
+                if all((form is None) or hasattr(form, "_cpp_object") for row in jacobian for form in row):  # type: ignore[arg-type]
+                    apply_lifting(b, jacobian, bcs=bcs1, x0=x, alpha=-1.0)
+                    dolfinx.la.petsc._ghost_update(b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE)  # type: ignore[attr-defined]
                 else:
-                    form_pairs = list(zip(lifting_forms, lifting_forms_ufl))
-
-                for lifting_form, lifting_form_ufl in form_pairs:
-                    if lifting_form_ufl is not None:
-                        average_coefficients(lifting_form_ufl)
+                    raise RuntimeError(
+                        "Dirichlet residual lifting for block/nest problems requires "
+                        "compiled Jacobian blocks; algebraic lifting fallback is disabled."
+                    )
+                if isinstance(residual, CompiledFormBundle):
+                    if residual.direct is None:
+                        raise RuntimeError(
+                            "Block residual assembly requires direct compiled forms."
+                        )
+                    residual_spaces = _extract_function_spaces(residual.direct)  # type: ignore[arg-type]
+                else:
+                    residual_spaces = _extract_function_spaces(residual)  # type: ignore[arg-type]
+                bcs0 = _bcs_by_block(residual_spaces, bcs)  # type: ignore[arg-type]
+                set_bc(b, bcs0, x0=x, alpha=-1.0)
+        else:
+            if bcs:
+                lifting_forms = [form for form in jacobian if form is not None and form.rank == 2]
+                if len(lifting_forms) == 0:
+                    raise RuntimeError(
+                        "Dirichlet residual lifting requires a compiled Jacobian form; "
+                        "algebraic lifting fallback is disabled."
+                    )
+                for lifting_form in lifting_forms:
                     apply_lifting(b, [lifting_form], bcs=[bcs], x0=[x], alpha=-1.0)
                 dolfinx.la.petsc._ghost_update(
                     b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
                 )  # type: ignore[attr-defined]
-            elif hasattr(jacobian, "_cpp_object"):
-                apply_lifting(b, [jacobian], bcs=[bcs], x0=[x], alpha=-1.0)
-                dolfinx.la.petsc._ghost_update(
-                    b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
-                )  # type: ignore[attr-defined]
-            else:
+                set_bc(b, bcs, x0=x, alpha=-1.0)
+    else:
+        if bcs:
+            lifting_pairs = _bundle_lifting_pairs(jacobian)
+            if len(lifting_pairs) == 0:
                 raise RuntimeError(
                     "Dirichlet residual lifting requires a compiled Jacobian form; "
                     "algebraic lifting fallback is disabled."
                 )
+            for lifting_form, lifting_form_ufl in lifting_pairs:
+                if lifting_form_ufl is not None:
+                    average_coefficients(lifting_form_ufl)
+                apply_lifting(b, [lifting_form], bcs=[bcs], x0=[x], alpha=-1.0)
+            dolfinx.la.petsc._ghost_update(
+                b, PETSc.InsertMode.ADD, PETSc.ScatterMode.REVERSE
+            )  # type: ignore[attr-defined]
             set_bc(b, bcs, x0=x, alpha=-1.0)
     dolfinx.la.petsc._ghost_update(
         b, PETSc.InsertMode.INSERT, PETSc.ScatterMode.FORWARD
@@ -353,8 +549,10 @@ def assemble_residual(
 
 def assemble_jacobian(
     u: Sequence[_Function] | _Function,
-    jacobian: ufl.Form,
-    preconditioner: ufl.Form | None,
+    jacobian: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
+    preconditioner: (
+        Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle | None
+    ),
     bcs: Sequence[DirichletBC],
     _snes: PETSc.SNES,  # type: ignore[name-defined]
     x: PETSc.Vec,  # type: ignore[name-defined]
@@ -396,11 +594,11 @@ def assemble_jacobian(
 
     # Assemble Jacobian
     J.zeroEntries()
-    assemble_matrix(jacobian, bcs=bcs, A=J)
+    _assemble_compiled_matrix(J, jacobian, bcs)
     J.assemble()
     if preconditioner is not None:
         P_mat.zeroEntries()
-        assemble_matrix(preconditioner, bcs=bcs, A=P_mat)
+        _assemble_compiled_matrix(P_mat, preconditioner, bcs)
         P_mat.assemble()
 
 
@@ -412,11 +610,6 @@ class NonlinearProblem:
     :math:`F_i(u, v) = 0, i=0,\\ldots,N\\ \\forall v \\in V` where
     :math:`u=(u_0,\\ldots,u_N), v=(v_0,\\ldots,v_N)` using PETSc
     SNES as the non-linear solver.
-
-    Note:
-        The deprecated version of this class for use with
-        :class:`dolfinx.nls.petsc.NewtonSolver` has been renamed
-        :class:`dolfinx.fem.petsc.NewtonSolverNonlinearProblem`.
 
     Note:
         This high-level class automatically handles PETSc memory
@@ -508,153 +701,170 @@ class NonlinearProblem:
         self._x = None
         self._P_mat = None
 
-        # Keep UFL forms for fenicsx_ii assemblers
-        self._F_ufl = F
-
+        bcs = [] if bcs is None else bcs
         if J is None:
             J = derivative_block(F, u)
-        self._J_ufl = J
-        self._preconditioner_ufl = P
-        bcs = [] if bcs is None else bcs
 
-        # Keep residual in UFL form. It may contain custom operators
-        # (e.g. Average) that are not directly compilable by FFCx.
-        self._F = F
-
-        # Prefer a compiled Jacobian form for lifting in residual assembly.
-        # For custom operators that FFCx cannot process directly, compile
-        # the apply_replacer-transformed Jacobian contributions instead.
-        self._J_lifting: Sequence[Form] | None = None
-        self._J_lifting_ufl: Sequence[ufl.Form] | None = None
-        direct_compile_error: Exception | None = None
-        replacer_compile_error: Exception | None = None
         try:
-            self._J = _create_form(
+            self._F_bundle = compile_form_bundle(
+                F,
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
+        except Exception as exc:
+            raise RuntimeError("Could not compile residual form.") from exc
+
+        try:
+            self._J_bundle = compile_form_bundle(
                 J,
                 form_compiler_options=form_compiler_options,
                 jit_options=jit_options,
                 entity_maps=entity_maps,
             )
-            if isinstance(self._J, Form):
-                self._J_lifting = [self._J]
         except Exception as exc:
-            direct_compile_error = exc
-            self._J = J
-            if isinstance(J, ufl.Form):
-                try:
-                    replaced_forms = apply_replacer(J)
-                    self._J_lifting_ufl = replaced_forms
-                    self._J_lifting = [
-                        _create_form(
-                            j_form,
-                            form_compiler_options=form_compiler_options,
-                            jit_options=jit_options,
-                            entity_maps=entity_maps,
-                        )
-                        for j_form in replaced_forms
-                    ]
-                except Exception as exc_replaced:
-                    replacer_compile_error = exc_replaced
-                    self._J_lifting = None
-                    self._J_lifting_ufl = None
-
-        def _has_compiled_lifting_path() -> bool:
-            if isinstance(self._J, Sequence):
-                return all(
-                    (form is None) or hasattr(form, "_cpp_object")
-                    for row in self._J
-                    for form in row
-                )
-
-            if hasattr(self._J, "_cpp_object"):
-                return True
-
-            return (
-                self._J_lifting is not None
-                and len(self._J_lifting) > 0
-                and all(hasattr(j_form, "_cpp_object") for j_form in self._J_lifting)
-            )
-
-        if bcs and not _has_compiled_lifting_path():
-            diagnostics = []
-            if direct_compile_error is not None:
-                diagnostics.append(
-                    "direct Jacobian compilation failed: "
-                    f"{type(direct_compile_error).__name__}: {direct_compile_error}"
-                )
-            if replacer_compile_error is not None:
-                diagnostics.append(
-                    "replacer Jacobian compilation failed: "
-                    f"{type(replacer_compile_error).__name__}: {replacer_compile_error}"
-                )
-            if not diagnostics:
-                diagnostics.append("no compiled Jacobian lifting forms were produced")
-
-            error = RuntimeError(
-                "Dirichlet residual lifting requires compiled Jacobian form(s); "
-                "algebraic lifting fallback is disabled. Compile the Jacobian "
-                "directly or make apply_replacer(J) compilable.\n"
-                "Compilation diagnostics:\n- " + "\n- ".join(diagnostics)
-            )
-            raise error from (replacer_compile_error or direct_compile_error)
+            raise RuntimeError("Could not compile Jacobian form.") from exc
 
         if P is not None:
-            self._preconditioner = P
+            try:
+                self._P_bundle = compile_form_bundle(
+                    P,
+                    form_compiler_options=form_compiler_options,
+                    jit_options=jit_options,
+                    entity_maps=entity_maps,
+                )
+            except Exception as exc:
+                raise RuntimeError("Could not compile preconditioner form.") from exc
         else:
-            self._preconditioner = None
+            self._P_bundle = None
+
+        self._F = (
+            self._F_bundle.direct
+            if self._F_bundle.direct is not None
+            else self._F_bundle
+        )
+        self._J = (
+            self._J_bundle.direct
+            if self._J_bundle.direct is not None
+            else self._J_bundle
+        )
+        self._preconditioner = (
+            self._P_bundle.direct
+            if (self._P_bundle is not None and self._P_bundle.direct is not None)
+            else (
+                None
+                if self._P_bundle is None
+                else self._P_bundle
+            )
+        )
+
+        def _has_compiled_lifting_path(
+            form_data: Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle,
+        ) -> bool:
+            if isinstance(form_data, CompiledFormBundle):
+                if form_data.direct is not None:
+                    return any(form.rank == 2 for form in _flatten_forms(form_data.direct))
+                return any(contribution.rank == 2 for contribution in form_data.contributions)
+            if isinstance(form_data, Sequence):
+                flattened = _flatten_forms(form_data)
+                return len(flattened) > 0 and all(
+                    hasattr(form, "_cpp_object") and form.rank == 2
+                    for form in flattened
+                )
+            return hasattr(form_data, "_cpp_object") and form_data.rank == 2
+
+        if bcs and not _has_compiled_lifting_path(self._J_bundle):
+            raise RuntimeError(
+                "Dirichlet residual lifting requires compiled Jacobian form(s); "
+                "algebraic lifting fallback is disabled."
+            )
 
         self._u = u
 
+        # Derive vector/matrix kind from matrix type if not explicitly set
+        matrix_kind = kind
+
         # Create PETSc structures for the residual, Jacobian and solution
         # vector
-        self._A = create_matrix(
-            self._J_ufl,
-            form_compiler_options=form_compiler_options,
-            jit_options=jit_options,
-            entity_maps=entity_maps,
-        )
-        # Create PETSc structure for preconditioner if provided
-        if self._preconditioner_ufl is not None:
-            self._P_mat = create_matrix(
-                self._preconditioner_ufl,
+        if self._J_bundle.direct is not None:
+            self._A = dolfinx.fem.petsc.create_matrix(self._J_bundle.direct, kind=kind)
+        else:
+            self._A = create_matrix(
+                J,  # type: ignore[arg-type]
                 form_compiler_options=form_compiler_options,
                 jit_options=jit_options,
                 entity_maps=entity_maps,
             )
+
+        # Create PETSc structure for preconditioner if provided
+        if self._P_bundle is not None:
+            if self._P_bundle.direct is not None:
+                self._P_mat = dolfinx.fem.petsc.create_matrix(
+                    self._P_bundle.direct, kind=kind
+                )
+            else:
+                self._P_mat = create_matrix(
+                    P,  # type: ignore[arg-type]
+                    form_compiler_options=form_compiler_options,
+                    jit_options=jit_options,
+                    entity_maps=entity_maps,
+                )
         else:
             self._P_mat = None
 
-        self._b = create_vector(
-            self._F_ufl,
-            form_compiler_options=form_compiler_options,
-            jit_options=jit_options,
-            entity_maps=entity_maps,
+        matrix_kind = (
+            "nest" if self._A.getType() == PETSc.Mat.Type.NEST else matrix_kind  # type: ignore[attr-defined]
         )
-        self._x = create_vector(
-            self._F_ufl,
-            form_compiler_options=form_compiler_options,
-            jit_options=jit_options,
-            entity_maps=entity_maps,
-        )
+        assert matrix_kind is None or isinstance(matrix_kind, str)
+
+        if self._F_bundle.direct is not None:
+            spaces = _extract_function_spaces(self._F_bundle.direct)
+            self._b = dolfinx.fem.petsc.create_vector(spaces, kind=matrix_kind)
+            self._x = dolfinx.fem.petsc.create_vector(spaces, kind=matrix_kind)
+        else:
+            self._b = create_vector(
+                F,  # type: ignore[arg-type]
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
+            self._x = create_vector(
+                F,  # type: ignore[arg-type]
+                form_compiler_options=form_compiler_options,
+                jit_options=jit_options,
+                entity_maps=entity_maps,
+            )
 
         # Create the SNES solver and attach the corresponding Jacobian and
         # residual computation functions
+        jacobian_cb = (
+            self._J_bundle.direct
+            if self._J_bundle.direct is not None
+            else self._J_bundle
+        )
+        preconditioner_cb = (
+            None
+            if self._P_bundle is None
+            else (
+                self._P_bundle.direct
+                if self._P_bundle.direct is not None
+                else self._P_bundle
+            )
+        )
+        residual_cb = (
+            self._F_bundle.direct
+            if self._F_bundle.direct is not None
+            else self._F_bundle
+        )
+
         self._snes = PETSc.SNES().create(self.A.comm)  # type: ignore[attr-defined]
         self.solver.setJacobian(
-            partial(assemble_jacobian, u, self._J_ufl, self._preconditioner_ufl, bcs),
+            partial(assemble_jacobian, u, jacobian_cb, preconditioner_cb, bcs),
             self.A,
             self.P_mat,
         )
         self.solver.setFunction(
-            partial(
-                assemble_residual,
-                u,
-                self._F_ufl,
-                self.J,
-                bcs,
-                lifting_forms=self._J_lifting,
-                lifting_forms_ufl=self._J_lifting_ufl,
-            ),
+            partial(assemble_residual, u, residual_cb, jacobian_cb, bcs),
             self.b,
         )
 
@@ -684,7 +894,7 @@ class NonlinearProblem:
 
             opts.prefixPop()
 
-        if self.P_mat is not None and kind == "nest":
+        if self.P_mat is not None and matrix_kind == "nest":
             # Transfer nest IS on self.P_mat to PC of main KSP. This allows
             # fieldsplit preconditioning to be applied, if desired.
             nest_IS = self.P_mat.getNestISs()
@@ -740,17 +950,27 @@ class NonlinearProblem:
             obj.destroy()
 
     @property
-    def F(self) -> Form | Sequence[Form]:
+    def F(self) -> Form | Sequence[Form] | CompiledFormBundle:
         """The compiled residual."""
         return self._F
 
     @property
-    def J(self) -> Form | Sequence[Sequence[Form]]:
+    def J(
+        self,
+    ) -> Form | Sequence[Form] | Sequence[Sequence[Form]] | CompiledFormBundle:
         """The compiled Jacobian."""
         return self._J
 
     @property
-    def preconditioner(self) -> Form | Sequence[Sequence[Form]] | None:
+    def preconditioner(
+        self,
+    ) -> (
+        Form
+        | Sequence[Form]
+        | Sequence[Sequence[Form]]
+        | CompiledFormBundle
+        | None
+    ):
         """The compiled preconditioner."""
         return self._preconditioner
 
